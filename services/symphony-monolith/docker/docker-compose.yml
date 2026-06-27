@@ -1,0 +1,72 @@
+services:
+  db:
+    image: postgres:16-alpine
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: dev
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://localhost:8080/health > /dev/null || exit 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    ports:
+      - "8080:8080"
+    volumes:
+      - ..:/app
+      - vendor:/app/vendor
+    environment:
+      APP_ENV: dev
+      DATABASE_URL: "${DATABASE_URL:?Set DATABASE_URL (for local use this should point to DEV Cloud SQL)}"
+      OFFERS_SERVICE_URL: "http://offers-service:8082"
+    depends_on:
+      offers-service:
+        condition: service_healthy
+
+  offers-service:
+    build:
+      context: ../../offers-service
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://localhost:8082/health || exit 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    ports:
+      - "8082:8082"
+    environment:
+      DATABASE_URL: "${DATABASE_URL:?Set DATABASE_URL (for local use this should point to DEV Cloud SQL)}"
+      PORT: "8082"
+
+volumes:
+  vendor:
+  postgres_data:

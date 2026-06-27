@@ -1,0 +1,266 @@
+terraform {
+  required_version = ">= 1.0"
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.6"
+    }
+  }
+}
+
+provider "google" {
+  project = var.project
+  region  = var.region
+}
+
+resource "random_password" "db_dev_password" {
+  length  = 24
+  special = false
+}
+
+resource "random_password" "db_prod_password" {
+  length  = 24
+  special = false
+}
+
+resource "google_sql_database_instance" "dev" {
+  name                = var.db_dev_instance_name
+  region              = var.region
+  database_version    = "POSTGRES_15"
+  deletion_protection = false
+
+  settings {
+    tier = "db-custom-1-3840"
+
+    ip_configuration {
+      ipv4_enabled = true
+
+      authorized_networks {
+        name  = "open-for-labs"
+        value = "0.0.0.0/0"
+      }
+    }
+  }
+}
+
+resource "google_sql_database_instance" "prod" {
+  name                = var.db_prod_instance_name
+  region              = var.region
+  database_version    = "POSTGRES_15"
+  deletion_protection = false
+
+  settings {
+    tier = "db-custom-1-3840"
+
+    ip_configuration {
+      ipv4_enabled = true
+
+      authorized_networks {
+        name  = "open-for-labs"
+        value = "0.0.0.0/0"
+      }
+    }
+  }
+}
+
+resource "google_sql_database" "dev" {
+  name     = var.db_dev_name
+  instance = google_sql_database_instance.dev.name
+}
+
+resource "google_sql_database" "prod" {
+  name     = var.db_prod_name
+  instance = google_sql_database_instance.prod.name
+}
+
+resource "google_sql_user" "dev" {
+  name     = var.db_username
+  instance = google_sql_database_instance.dev.name
+  password = random_password.db_dev_password.result
+}
+
+resource "google_sql_user" "prod" {
+  name     = var.db_username
+  instance = google_sql_database_instance.prod.name
+  password = random_password.db_prod_password.result
+}
+
+resource "google_artifact_registry_repository" "mini_allegro" {
+  repository_id = "mini-allegro"
+  location      = var.region
+  format        = "DOCKER"
+  description   = "Docker repository for mini-allegro"
+}
+
+# product-review-service ma osobny root Terraform (infra/product-review-service/),
+# więc nie możemy bezpośrednio odwołać się do jego zasobu przez referencję.
+# Zamiast tego używamy data source, który pobiera URI już zdeployowanego serwisu z GCP.
+# Zakomentowane dla nowej migracji - product-review-service będzie wdrożony oddzielnie.
+# data "google_cloud_run_v2_service" "product_review_service" {
+#   name     = "product-review-service-dev"
+#   location = var.region
+# }
+
+resource "google_cloud_run_v2_service" "mini_allegro" {
+  name     = var.service_name
+  location = var.region
+
+  template {
+    containers {
+      image = "${var.region}-docker.pkg.dev/${var.project}/${google_artifact_registry_repository.mini_allegro.repository_id}/${var.service_name}:latest"
+
+      ports {
+        container_port = 8080
+      }
+
+      resources {
+        limits = {
+          cpu    = "1"
+          memory = "512Mi"
+        }
+        startup_cpu_boost = true
+      }
+
+      env {
+        name  = "APP_ENV"
+        value = "prod"
+      }
+
+      env {
+        name  = "PURCHASE_SERVICE_URL"
+        value = google_cloud_run_v2_service.purchase_service.uri
+      }
+
+      env {
+        name  = "DATABASE_URL"
+        value = format("postgresql://%s:%s@%s:5432/%s?sslmode=require", google_sql_user.dev.name, random_password.db_dev_password.result, google_sql_database_instance.dev.public_ip_address, google_sql_database.dev.name)
+      }
+
+      # PRODUCT_REVIEW_SERVICE_URL będzie dodana po wdrożeniu product-review-service
+      # env {
+      #   name  = "PRODUCT_REVIEW_SERVICE_URL"
+      #   value = data.google_cloud_run_v2_service.product_review_service.uri
+      # }
+    }
+
+    scaling {
+      min_instance_count = 0
+      max_instance_count = 10
+    }
+  }
+
+  traffic {
+    type    = "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST"
+    percent = 100
+  }
+}
+
+# Cloud Build service account musi mieć prawo pushować obrazy do Artifact Registry
+data "google_project" "project" {}
+
+# NOTE: IAM permissions for Cloud Build disabled due to insufficient permissions on falkowskisz01@gmail.com
+# To enable, grant artifactregistry.repositories.setIamPolicy permission or manually set IAM after deployment
+# resource "google_artifact_registry_repository_iam_member" "cloudbuild_writer" {
+#   location   = google_artifact_registry_repository.mini_allegro.location
+#   repository = google_artifact_registry_repository.mini_allegro.repository_id
+#   role       = "roles/artifactregistry.writer"
+#   member     = "serviceAccount:${data.google_project.project.number}@cloudbuild.gserviceaccount.com"
+# }
+
+# NOTE: IAM permissions for Cloud Run disabled due to insufficient permissions on falkowskisz01@gmail.com
+# To enable, grant run.services.setIamPolicy permission or manually set IAM using gcloud:
+# gcloud run services add-iam-policy-binding mini-allegro \
+#   --region=europe-central2 \
+#   --member=allUsers \
+#   --role=roles/run.invoker \
+#   --project=paw-2026-496213
+# resource "google_cloud_run_v2_service_iam_member" "mini_allegro_public_access" {
+#   location = google_cloud_run_v2_service.mini_allegro.location
+#   name     = google_cloud_run_v2_service.mini_allegro.name
+#   role     = "roles/run.invoker"
+#   member   = "allUsers"
+# }
+
+resource "google_logging_metric" "cloud_run_error_count" {
+  name        = "mini_allegro_cloud_run_error_count"
+  description = "Counts ERROR and higher severity logs emitted by mini-allegro Cloud Run service"
+  filter = join(" AND ", [
+    "resource.type=\"cloud_run_revision\"",
+    "resource.labels.service_name=\"${var.service_name}\"",
+    "severity>=ERROR",
+  ])
+}
+
+resource "google_monitoring_notification_channel" "email" {
+  display_name = "mini-allegro-alert-email"
+  type         = "email"
+
+  labels = {
+    email_address = var.alert_email
+  }
+}
+
+resource "google_monitoring_alert_policy" "cloud_run_error_burst" {
+  display_name = "mini-allegro Cloud Run error burst"
+  combiner     = "OR"
+
+  documentation {
+    subject   = "[mini-allegro] 5+ ERROR logs in 5 minutes"
+    mime_type = "text/markdown"
+    content   = <<-EOT
+      Wykryto nagromadzenie błędów aplikacji mini-allegro.
+
+      **Warunek alertu:** więcej niż 4 logi o `severity>=ERROR` w 5 minut (czyli 5+ błędów).
+
+      **Co sprawdzić od razu:**
+      1. Cloud Logging -> Logs Explorer
+      2. Użyj filtra:
+
+      ```
+      resource.type="cloud_run_revision"
+      resource.labels.service_name="mini-allegro"
+      severity>=ERROR
+      ```
+
+      **Uwaga:** mail alertowy z Cloud Monitoring nie dołącza pełnej listy treści logów; szczegółowy opis błędów jest w Cloud Logging.
+    EOT
+  }
+
+  conditions {
+    display_name = "5+ errors in 5 minutes"
+
+    condition_threshold {
+      filter = join(" AND ", [
+        "metric.type=\"logging.googleapis.com/user/${google_logging_metric.cloud_run_error_count.name}\"",
+        "resource.type=\"cloud_run_revision\"",
+        "resource.labels.service_name=\"${var.service_name}\"",
+      ])
+      comparison      = "COMPARISON_GT"
+      threshold_value = 4
+      duration        = "0s"
+
+      aggregations {
+        alignment_period     = "300s"
+        per_series_aligner   = "ALIGN_SUM"
+        cross_series_reducer = "REDUCE_SUM"
+        group_by_fields      = ["resource.labels.service_name"]
+      }
+
+      trigger {
+        count = 1
+      }
+    }
+  }
+
+  notification_channels = [google_monitoring_notification_channel.email.name]
+
+  alert_strategy {
+    auto_close = "1800s"
+  }
+
+  enabled = true
+}

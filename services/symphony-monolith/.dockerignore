@@ -1,0 +1,31 @@
+# Git
+.git
+.gitignore
+.gcloudignore
+
+# Symfony cache / logs
+/var/
+
+# Composer deps (re-installed during build)
+/vendor/
+
+# Docker files
+docker/*.yml
+
+# Python test env
+/.venv
+/.pytest_cache
+__pycache__/
+
+# Infra
+/infra/
+
+# Env files – only local overrides are excluded; .env must stay in image (Symfony PathException)
+# Runtime env vars from Cloud Run take precedence when variables_order includes E in php.ini
+.env.local
+.env.local.php
+.env.*.local
+
+# Editor
+.editorconfig
+*.md
